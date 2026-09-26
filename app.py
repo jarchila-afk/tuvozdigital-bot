@@ -16,7 +16,17 @@ ACCESS_TOKEN = (
     or os.environ.get("TOKEN")
 )
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+# Numero de Jaime que recibe los avisos (se guarda en Render, sin + ni espacios)
+ADMIN_NUMBER = (os.environ.get("ADMIN_NUMBER") or "").replace("+", "").replace(" ", "").strip()
 GRAPH_URL = "https://graph.facebook.com/v23.0"
+
+# Estado de cada cliente mientras el servidor esta encendido
+# "esperando" = pidio asesor y esperamos sus datos
+# "con_asesor" = ya mando sus datos; lo que escriba se reenvia a Jaime
+estado_clientes = {}
+
+SALUDOS = {"hola", "menu", "menú", "inicio", "buenas", "buenos dias", "buenos días",
+           "buenas tardes", "buenas noches", "hi", "hello", "0"}
 
 
 # ---------- Textos del bot ----------
@@ -53,29 +63,18 @@ OPCION_3 = (
     "Si quieres, cuéntanos aquí el nombre de tu negocio y a qué se dedica."
 )
 
-
-def responder(texto):
-    """Decide que contestar segun lo que escribio el cliente."""
-    t = (texto or "").strip().lower()
-    if t == "1":
-        return OPCION_1
-    if t == "2":
-        return OPCION_2
-    if t == "3":
-        return OPCION_3
-    return MENU
+GRACIAS_DATOS = (
+    "✅ ¡Gracias! Ya le pasamos tu información al asesor. "
+    "Te escribirá muy pronto.\n\n"
+    "Si quieres volver al menú, escribe *menu*."
+)
 
 
 # ---------- Enviar mensajes a WhatsApp ----------
 
-def enviar_mensaje(numero, texto):
+def llamar_api(datos):
+    """Envia un mensaje a Meta. Devuelve True si salio bien."""
     url = f"{GRAPH_URL}/{PHONE_NUMBER_ID}/messages"
-    datos = {
-        "messaging_product": "whatsapp",
-        "to": numero,
-        "type": "text",
-        "text": {"body": texto},
-    }
     req = urllib.request.Request(
         url,
         data=json.dumps(datos).encode("utf-8"),
@@ -87,11 +86,125 @@ def enviar_mensaje(numero, texto):
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            print("Mensaje enviado a", numero, "- estado", r.status, flush=True)
+            print("Mensaje enviado a", datos.get("to"), "- estado", r.status, flush=True)
+            return True
     except urllib.error.HTTPError as e:
         print("Error al enviar:", e.code, e.read().decode(), flush=True)
     except Exception as e:
         print("Error al enviar:", e, flush=True)
+    return False
+
+
+def enviar_mensaje(numero, texto):
+    return llamar_api({
+        "messaging_product": "whatsapp",
+        "to": numero,
+        "type": "text",
+        "text": {"body": texto},
+    })
+
+
+def enviar_plantilla(numero, nombre, parametros):
+    """Plan B para avisar a Jaime cuando pasaron mas de 24 horas.
+    Solo funciona cuando la plantilla exista y este aprobada en Meta."""
+    limpios = [" ".join(str(p).split())[:900] for p in parametros]
+    return llamar_api({
+        "messaging_product": "whatsapp",
+        "to": numero,
+        "type": "template",
+        "template": {
+            "name": nombre,
+            "language": {"code": "es"},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": p} for p in limpios],
+            }],
+        },
+    })
+
+
+def avisar_admin(texto_aviso, numero_cliente, detalle):
+    if not ADMIN_NUMBER:
+        print("AVISO (sin ADMIN_NUMBER configurado):", texto_aviso, flush=True)
+        return
+    if not enviar_mensaje(ADMIN_NUMBER, texto_aviso):
+        enviar_plantilla(ADMIN_NUMBER, "aviso_asesor", ["+" + numero_cliente, detalle])
+
+
+# ---------- Logica del bot ----------
+
+def reenviar_desde_admin(texto):
+    """Jaime responde a un cliente escribiendo:  #50212345678 su mensaje"""
+    partes = texto.strip()[1:].split(" ", 1)
+    if len(partes) == 2 and partes[0].isdigit() and partes[1].strip():
+        destino, mensaje = partes[0], partes[1].strip()
+        if enviar_mensaje(destino, mensaje):
+            enviar_mensaje(ADMIN_NUMBER, f"✅ Enviado a +{destino}")
+        else:
+            enviar_mensaje(
+                ADMIN_NUMBER,
+                f"❌ No se pudo enviar a +{destino}. Puede que hayan pasado más de "
+                "24 horas desde su último mensaje; en ese caso escríbele desde tu WhatsApp.",
+            )
+    else:
+        enviar_mensaje(
+            ADMIN_NUMBER,
+            "Para responder a un cliente escribe así:\n#50212345678 Hola, soy Jaime de TuVozDigital...",
+        )
+
+
+def procesar(numero, texto, tipo):
+    t = (texto or "").strip().lower()
+
+    # Jaime respondiendo a un cliente
+    if numero == ADMIN_NUMBER and (texto or "").strip().startswith("#"):
+        reenviar_desde_admin(texto)
+        return
+
+    estado = estado_clientes.get(numero)
+
+    # Saludos o "menu": vuelve al inicio
+    if t in SALUDOS:
+        estado_clientes.pop(numero, None)
+        enviar_mensaje(numero, MENU)
+        return
+
+    if t == "1":
+        enviar_mensaje(numero, OPCION_1)
+        return
+    if t == "2":
+        enviar_mensaje(numero, OPCION_2)
+        return
+    if t == "3":
+        estado_clientes[numero] = "esperando"
+        enviar_mensaje(numero, OPCION_3)
+        avisar_admin(
+            "🔔 *Nuevo cliente pide asesor*\n"
+            f"Número: +{numero}\n"
+            f"Abrir su chat: https://wa.me/{numero}\n\n"
+            "Para responderle desde aquí escribe:\n"
+            f"#{numero} tu mensaje",
+            numero,
+            "pidió hablar con un asesor",
+        )
+        return
+
+    # Cliente que ya pidio asesor: reenviar lo que escriba
+    if estado in ("esperando", "con_asesor"):
+        contenido = texto if tipo == "text" else f"[envió un mensaje de tipo: {tipo}]"
+        if estado == "esperando":
+            enviar_mensaje(numero, GRACIAS_DATOS)
+            estado_clientes[numero] = "con_asesor"
+        avisar_admin(
+            f"💬 *Mensaje de +{numero}:*\n{contenido}\n\n"
+            f"Responder: #{numero} tu mensaje",
+            numero,
+            contenido,
+        )
+        return
+
+    # Cualquier otra cosa: mostrar el menu
+    enviar_mensaje(numero, MENU)
 
 
 # ---------- Rutas ----------
@@ -121,12 +234,10 @@ def recibir():
                 value = change.get("value", {})
                 for msg in value.get("messages", []):
                     numero = msg.get("from")
-                    if msg.get("type") == "text":
-                        texto = msg.get("text", {}).get("body", "")
-                    else:
-                        texto = ""
-                    print("Mensaje de", numero, ":", texto, flush=True)
-                    enviar_mensaje(numero, responder(texto))
+                    tipo = msg.get("type", "")
+                    texto = msg.get("text", {}).get("body", "") if tipo == "text" else ""
+                    print("Mensaje de", numero, ":", texto or f"[{tipo}]", flush=True)
+                    procesar(numero, texto, tipo)
     except Exception as e:
         print("Error procesando mensaje:", e, flush=True)
     return "OK", 200
