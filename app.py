@@ -3,6 +3,7 @@ import os
 import json
 import urllib.request
 import urllib.error
+import time
 
 app = Flask(__name__)
 
@@ -24,6 +25,10 @@ GRAPH_URL = "https://graph.facebook.com/v23.0"
 # "esperando" = pidio asesor y esperamos sus datos
 # "con_asesor" = ya mando sus datos; lo que escriba se reenvia a Jaime
 estado_clientes = {}
+
+# Ultima vez que Jaime le escribio al bot desde el Samsung (abre la ventana de 24 h)
+ultimo_mensaje_admin = 0
+VENTANA_SEGUNDOS = 23 * 60 * 60  # 23 horas, con margen de seguridad
 
 SALUDOS = {"hola", "menu", "menú", "inicio", "buenas", "buenos dias", "buenos días",
            "buenas tardes", "buenas noches", "hi", "hello", "0"}
@@ -123,12 +128,23 @@ def enviar_plantilla(numero, nombre, parametros):
     })
 
 
+def ventana_admin_abierta():
+    """True si Jaime le escribio al bot hace menos de 23 horas."""
+    return ultimo_mensaje_admin and (time.time() - ultimo_mensaje_admin) < VENTANA_SEGUNDOS
+
+
 def avisar_admin(texto_aviso, numero_cliente, detalle):
     if not ADMIN_NUMBER:
         print("AVISO (sin ADMIN_NUMBER configurado):", texto_aviso, flush=True)
         return
-    if not enviar_mensaje(ADMIN_NUMBER, texto_aviso):
-        enviar_plantilla(ADMIN_NUMBER, "aviso_asesor", ["+" + numero_cliente, detalle])
+    if ventana_admin_abierta():
+        # Ventana abierta: aviso normal con link y todo
+        if enviar_mensaje(ADMIN_NUMBER, texto_aviso):
+            return
+    # Ventana cerrada (o no sabemos): usar la plantilla aprobada por Meta
+    print("Usando plantilla aviso_asesor", flush=True)
+    if not enviar_plantilla(ADMIN_NUMBER, "aviso_asesor", ["+" + numero_cliente, detalle]):
+        enviar_mensaje(ADMIN_NUMBER, texto_aviso)
 
 
 # ---------- Logica del bot ----------
@@ -154,7 +170,12 @@ def reenviar_desde_admin(texto):
 
 
 def procesar(numero, texto, tipo):
+    global ultimo_mensaje_admin
     t = (texto or "").strip().lower()
+
+    # Cada vez que Jaime escribe al bot se abre la ventana de 24 horas
+    if numero == ADMIN_NUMBER:
+        ultimo_mensaje_admin = time.time()
 
     # Jaime respondiendo a un cliente
     if numero == ADMIN_NUMBER and (texto or "").strip().startswith("#"):
